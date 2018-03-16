@@ -14,7 +14,7 @@ __global__ void smooth_kernel(char *img,int width,int heigth,int channels)
 {
     unsigned int x = blockIdx.x*blockDim.x + threadIdx.x;
     unsigned int y = blockIdx.y*blockDim.y + threadIdx.y;
-    unsigned int offset = x + y*blockDim.x+gridDim.x;
+    unsigned int offset = x + y*blockDim.x*gridDim.x;
 
     float u = x/(float)width;
     float v = y/(float)heigth;
