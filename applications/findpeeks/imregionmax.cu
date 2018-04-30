@@ -1,58 +1,121 @@
-#include <iostream>
+#include "cuda.h"
+#include "cuda_runtime.h"
+#include "cuda_runtime_api.h"
+#include "device_functions.h"
+
 #include "opencv2/core/core.hpp"
 #include "opencv2/highgui/highgui.hpp"
 #include "opencv2/opencv.hpp"
-using namespace std;
+#include "stdio.h"
+#include <vector>
+#include <iostream>
 using namespace cv;
+using namespace std;
+
+#define Accuracy 0
 typedef  unsigned char eleType;
-Mat imregionmax(const Mat *src,eleType h);
-
-void LabShow(char wname[20],Mat src,Mat Label,Size offset)
+__global__ void  DilationStep(eleType *k,eleType *j,unsigned int total)
 {
+    unsigned int x = blockIdx.x*blockDim.x + threadIdx.x;
+    unsigned int y = blockIdx.y*blockDim.y + threadIdx.y;
+    unsigned int offset = x + y*blockDim.x*gridDim.x;
 
-    Mat sImg = src.clone();
-    if(sImg.channels()<3)
-        cvtColor(sImg,sImg,COLOR_GRAY2RGB);
-    int font_face = cv::FONT_HERSHEY_COMPLEX;
-    double font_scale = 1;
-    for(int x=0;x<Label.cols;x++)
-    {
-        for(int y=0;y<Label.cols;y++)
-        {
-            Point pos;
-            pos.x=x+offset.width;
-            pos.y=y+offset.height;
-            if(Label.at<uchar>(y,x))
-                putText(sImg,"x",pos,font_face,font_scale,Scalar(0,0,255),3,8);
-        }
-    }
-    imshow(wname,sImg);
+    unsigned int width  = blockDim.x*gridDim.x;
+    unsigned int heigth = blockDim.y*gridDim.y;
+
+    if(offset > total) return;
+
+    unsigned int left,right,top,bottom;
+    left = offset -1;
+    right = offset+1;
+    if (x==0) left++;
+    if (x==width-1) right--;
+    top     = offset - width;
+    bottom  = offset + width;
+    if (y==0)           top += width;
+    if (y==heigth-1)    bottom -= width;
+
+    eleType max = j[offset];
+    if(j[left]  -   max > Accuracy)     max = j[left];
+    if(j[right] -   max > Accuracy)     max = j[right];
+    if(j[bottom]-   max > Accuracy)     max = j[bottom];
+    if(j[top]   -   max > Accuracy)     max = j[top];
+    unsigned int leftbottom,lefttop,righttop,rightbottom;
+    leftbottom  = bottom - 1;
+    if(x==0) leftbottom++;
+    rightbottom = bottom + 1;
+    if(x==width-1) rightbottom--;
+    lefttop     = top    - 1;
+    if(x==0)    lefttop++;
+    righttop    = top    + 1;
+    if(x==width-1) righttop--;
+
+    if(j[leftbottom]    -   max > Accuracy)     max = j[leftbottom];
+    if(j[rightbottom]   -   max > Accuracy)     max = j[rightbottom];
+    if(j[lefttop]       -   max > Accuracy)     max = j[lefttop];
+    if(j[righttop]      -   max > Accuracy)     max = j[righttop];
+
+    k[offset] =max;
+}
+__global__ void PointwiseMinimum(eleType *I,eleType *J,eleType *K,unsigned int total)
+{
+    unsigned int x = blockIdx.x*blockDim.x + threadIdx.x;
+    unsigned int y = blockIdx.y*blockDim.y + threadIdx.y;
+    unsigned int offset = x + y*blockDim.x*gridDim.x;
+    if(I[offset] - K[offset] <Accuracy)
+        J[offset] = I[offset];
+    else
+        J[offset] = K[offset];
 }
 
-
-int main(int argc, char *argv[])
+#define DIM 16
+Mat imregionmax(const Mat *src,eleType h)
 {
+     Mat LocMax     = src->clone();
+     int width      = src->cols;
+     int height     = src->rows;
+     Mat Imask      = src->clone();
+     Mat Jmasker    = Imask - h;
+     Mat K          = Jmasker.clone();
+     Mat Tmp        = src->clone();
 
-    Mat src(Size(1024,1024),CV_8UC1);
-    src.setTo(0);
-    circle(src,Point(200,200),100,Scalar(255),-1);
-    circle(src,Point(300,300),100,Scalar(255),-1);
-    circle(src,Point(400,600),100,Scalar(255),-1);
-    circle(src,Point(550,600),100,Scalar(255),-1);
-    namedWindow("input", CV_WINDOW_NORMAL);
-    imshow("input",src);
+     eleType *Jmasker_dev,*Imask_dev,*K_dev;
 
-    Mat dis=Mat(src.size(),CV_32FC1);
-    distanceTransform(src,dis,CV_DIST_L2,3);
-    normalize(dis,dis,1.0,0.0,NORM_MINMAX);
-    dis = dis *255;dis.convertTo(dis,CV_8U);
-    namedWindow("distance Transfrom", CV_WINDOW_NORMAL);
-    imshow("distance Transfrom",dis);
+     cudaMalloc((void**)&Jmasker_dev,width*height*sizeof(eleType));
+     cudaMemcpy(Jmasker_dev,Jmasker.data,width*height*sizeof(eleType),cudaMemcpyHostToDevice);
+     cudaMalloc((void**)&Imask_dev,width*height*sizeof(eleType));
+     cudaMemcpy(Imask_dev,Imask.data,width*height*sizeof(eleType),cudaMemcpyHostToDevice);
+     cudaMalloc((void**)&K_dev,width*height*sizeof(eleType));
 
-    namedWindow("peeks", CV_WINDOW_NORMAL);
-    Mat peeks = imregionmax(&dis,1);
-    LabShow("peeks",dis,peeks,Size(0,0));
+     cudaError_t cudaStatus;
+     while(1)
+     {
 
-    waitKey(0);
-    return 0;
+         dim3 blocks(64,64);
+         dim3 threads((blocks.x+width-1)/blocks.x,(blocks.y+height-1)/blocks.y);
+         DilationStep<<<blocks,threads>>>(K_dev,Jmasker_dev,width*height);
+         cudaDeviceSynchronize();
+         cudaStatus= cudaGetLastError();
+         if (cudaStatus != cudaSuccess)
+         {
+             fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+             return LocMax;
+         }
+         cudaMemcpy(K.data,K_dev,width*height*sizeof(eleType),cudaMemcpyDeviceToHost);
+         PointwiseMinimum<<<blocks,threads>>>(Imask_dev,Jmasker_dev,K_dev,width*height);
+         if (cudaStatus != cudaSuccess)
+         {
+             fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+             return LocMax;
+         }
+         cudaMemcpy(Tmp.data,Jmasker_dev,width*height*sizeof(eleType),cudaMemcpyDeviceToHost);
+         if (memcmp(Tmp.data,Jmasker.data,width*height*sizeof(eleType))==0) break;
+         else cudaMemcpy(Jmasker.data,Jmasker_dev,width*height*sizeof(eleType),cudaMemcpyDeviceToHost);
+     }
+     cudaFree(Imask_dev);
+     cudaFree(Jmasker_dev);
+     cudaFree(K_dev);
+     LocMax = (Imask-Jmasker>0);
+     return LocMax;
 }
+
